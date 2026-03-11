@@ -38,6 +38,15 @@ class Directory : public Entry, public std::enable_shared_from_this<Directory> {
 
   iterator find(std::string_view key) const;
 
+  // Create a new file in this directory with optional initial data
+  // If data is empty, creates an empty file (category 0)
+  // Otherwise, allocates appropriate blocks and writes the data
+  std::expected<std::shared_ptr<File>, WfsError> CreateFile(std::string_view name,
+                                                            std::span<const std::byte> data = {});
+
+  // Create a new empty directory in this directory
+  std::expected<std::shared_ptr<Directory>, WfsError> CreateDirectory(std::string_view name);
+
   const std::shared_ptr<QuotaArea>& quota() const { return quota_; }
 
  private:

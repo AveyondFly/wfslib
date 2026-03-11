@@ -12,6 +12,7 @@
 
 enum WfsError {
   kEntryNotFound,
+  kEntryAlreadyExists,
   kNotDirectory,
   kNotFile,
   kBlockBadHash,

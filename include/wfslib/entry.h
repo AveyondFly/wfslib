@@ -15,6 +15,7 @@
 #include "structs.h"
 
 class QuotaArea;
+class Directory;
 
 class Entry {
  public:
@@ -40,6 +41,7 @@ class Entry {
                                                               MetadataRef metadata_ref);
 
  protected:
+  friend class Directory;
   // TODO: Metadata copy as it can change?
   EntryMetadata* mutable_metadata() { return metadata_.get_mutable(); }
   const EntryMetadata* metadata() const { return metadata_.get(); }

@@ -11,6 +11,8 @@ char const* WfsException::what() const noexcept {
   switch (error_) {
     case WfsError::kEntryNotFound:
       return "Entry not found";
+    case WfsError::kEntryAlreadyExists:
+      return "Entry already exists";
     case WfsError::kNotDirectory:
       return "Not a directory";
     case WfsError::kNotFile:
