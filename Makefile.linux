@@ -1,0 +1,84 @@
+# Makefile for Linux build
+# Usage: make -f Makefile.linux [target]
+
+CXX = g++
+CXXFLAGS = -std=c++23 -Wall -Wextra -Wpedantic -fPIC
+DEBUG ?= 0
+ifeq ($(DEBUG), 1)
+    CXXFLAGS += -g -O0 -DDEBUG
+    BUILD_DIR = build/linux-debug
+else
+    CXXFLAGS += -O2
+    BUILD_DIR = build/linux-release
+endif
+
+INCLUDES = -I./include -I./include/wfslib -I./src
+LIBS = -L/usr/lib/x86_64-linux-gnu
+
+# System libraries
+BOOST_LIBS = -lboost_iostreams -lboost_filesystem -lboost_system
+CRYPTO_LIB = -lcrypto++
+OTHER_LIBS = -lz -lbz2 -llzma -lzstd -lpthread -ldl
+
+# Source files
+SRCDIR = src
+SOURCES = $(wildcard $(SRCDIR)/*.cpp)
+OBJECTS = $(patsubst $(SRCDIR)/%.cpp,$(BUILD_DIR)/%.o,$(SOURCES))
+
+# Output
+LIB_NAME = libwfslib.a
+LIB_PATH = $(BUILD_DIR)/$(LIB_NAME)
+
+# Test sources
+TESTDIR = tests
+TEST_SOURCES = $(wildcard $(TESTDIR)/*_tests.cpp)
+TEST_BINS = $(patsubst $(TESTDIR)/%.cpp,$(BUILD_DIR)/%,$(TEST_SOURCES))
+
+.PHONY: all clean lib tests rebuild
+
+all: lib
+
+$(BUILD_DIR):
+	mkdir -p $(BUILD_DIR)
+
+$(BUILD_DIR)/%.o: $(SRCDIR)/%.cpp | $(BUILD_DIR)
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -c $< -o $@
+
+lib: $(LIB_PATH)
+
+$(LIB_PATH): $(OBJECTS)
+	ar rcs $@ $^
+	@echo "Library built: $@"
+
+# Build tests
+tests: lib $(BUILD_DIR)
+	@for src in $(TEST_SOURCES); do \
+		test_name=$$(basename $$src .cpp); \
+		echo "Building test: $$test_name"; \
+		$(CXX) $(CXXFLAGS) $(INCLUDES) -o $(BUILD_DIR)/$$test_name $$src \
+			$(LIB_PATH) $(LIBS) $(BOOST_LIBS) $(CRYPTO_LIB) $(OTHER_LIBS) \
+			/usr/lib/libCatch2Main.a /usr/lib/libCatch2.a; \
+	done
+	@echo "Tests built in $(BUILD_DIR)"
+
+# Run tests
+run-tests: tests
+	@for test_bin in $(TEST_BINS); do \
+		echo "Running $$test_bin..."; \
+		$$test_bin || exit 1; \
+	done
+
+# Clean
+clean:
+	rm -rf build/linux-debug build/linux-release
+
+# Rebuild
+rebuild: clean all
+
+# Debug info
+info:
+	@echo "CXX: $(CXX)"
+	@echo "CXXFLAGS: $(CXXFLAGS)"
+	@echo "BUILD_DIR: $(BUILD_DIR)"
+	@echo "Sources: $(SOURCES)"
+	@echo "Objects: $(OBJECTS)"

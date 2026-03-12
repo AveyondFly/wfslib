@@ -140,17 +140,59 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
   // Category 4 would need indirect block handling - not implemented in this version
 
   size_t total_metadata_size = base_metadata_size + metadata_data_size;
-  // Align to power of 2, minimum size is 32 bytes (2^5)
-  size_t aligned_metadata_size = size_t{1} << std::max<size_t>(5, std::bit_width(total_metadata_size - 1));
 
   // Allocate and prepare data blocks for category 1+
   std::vector<uint32_t> allocated_blocks;
-  std::vector<std::vector<uint8_t>> block_hashes;
 
   // For Category 3: clusters info
   std::vector<uint32_t> allocated_clusters;
-  std::vector<std::array<std::vector<uint8_t>, 8>> cluster_hashes;
 
+  // For Category 4: metadata blocks
+  std::vector<uint32_t> allocated_metadata_blocks;
+
+  // First, insert into directory map to get the file metadata location
+  // Create EntryMetadata without data block info yet
+  EntryMetadata metadata{};
+  std::memset(&metadata, 0, sizeof(metadata));
+  metadata.flags = 0;  // Regular file (no DIRECTORY flag)
+  metadata.size_on_disk = size_on_disk;
+  metadata.file_size = size_on_disk;
+  metadata.size_category = category;
+  metadata.ctime = static_cast<uint32_t>(std::time(nullptr));
+  metadata.mtime = metadata.ctime;
+  metadata.directory_block_number = 0;
+  metadata.permissions.owner = 0;
+  metadata.permissions.group = 0;
+  metadata.permissions.mode = 0644;
+  metadata.filename_length = static_cast<uint8_t>(lowercase_name.size());
+  metadata.metadata_log2_size = static_cast<uint8_t>(std::max<size_t>(5, std::bit_width(total_metadata_size - 1)));
+
+  // Build case bitmap
+  uint8_t case_bitmap = 0;
+  for (size_t i = 0; i < name.size(); ++i) {
+    if (std::isupper(static_cast<unsigned char>(name[i]))) {
+      case_bitmap |= (1 << (i % 8));
+    }
+    if (i % 8 == 7) break;
+  }
+  metadata.case_bitmap = case_bitmap;
+
+  // Insert into directory map first to establish metadata location
+  if (!map_.insert(lowercase_name, &metadata)) {
+    return std::unexpected(WfsError::kNoSpace);
+  }
+
+  // Now get the file entry to find metadata location
+  auto entry_result = GetFile(name);
+  if (!entry_result.has_value()) {
+    return std::unexpected(entry_result.error());
+  }
+  auto file = entry_result.value();
+  std::shared_ptr<Block> file_metadata_block = file->metadata_block();
+  size_t aligned_size = size_t{1} << file->metadata()->metadata_log2_size.value();
+  std::byte* metadata_end = reinterpret_cast<std::byte*>(file->mutable_metadata()) + aligned_size;
+
+  // Now allocate and write data blocks with proper hash_ref
   if (category >= 1 && category <= 2 && !data.empty()) {
     BlockType block_type = (category == 1) ? BlockType::Single : BlockType::Large;
     size_t data_block_size = (category == 1) ? block_size : large_block_size;
@@ -158,30 +200,43 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
 
     auto blocks = quota_->AllocDataBlocks(static_cast<uint32_t>(blocks_needed), block_type);
     if (!blocks.has_value()) {
+      // Remove from directory map
+      std::string name_str(name);
+      map_.erase(name_str);
       return std::unexpected(blocks.error());
     }
     allocated_blocks = std::move(*blocks);
 
-    // Write data to each block and calculate hash
+    // Get pointer to hash storage location in metadata (reversed at end)
+    auto* block_meta_array = reinterpret_cast<DataBlockMetadata*>(metadata_end - blocks_needed * sizeof(DataBlockMetadata));
+
+    // Write data to each block
     for (size_t i = 0; i < allocated_blocks.size(); ++i) {
       size_t offset = i * data_block_size;
       size_t chunk_size = std::min(data.size() - offset, data_block_size);
 
-      // Load the data block for writing
+      // Set block number in metadata
+      block_meta_array[blocks_needed - 1 - i].block_number = allocated_blocks[i];
+
+      // Create hash_ref pointing to the hash location in file metadata
+      Block::HashRef hash_ref{file_metadata_block, file_metadata_block->to_offset(block_meta_array[blocks_needed - 1 - i].hash)};
+
+      // Load and write the data block with proper hash_ref
       auto data_block = quota_->LoadDataBlock(
           allocated_blocks[i],
           static_cast<BlockSize>(quota_->block_size_log2()),
           block_type,
           static_cast<uint32_t>(chunk_size),
-          {nullptr, 0},  // hash will be calculated on flush
+          hash_ref,  // Now with proper hash_ref!
           true,  // encrypted
           true   // new_block
       );
       if (!data_block.has_value()) {
-        // Rollback allocated blocks
         for (uint32_t blk : allocated_blocks) {
           quota_->DeleteBlocks(blk, 1);
         }
+        std::string name_str(name);
+        map_.erase(name_str);
         return std::unexpected(data_block.error());
       }
 
@@ -189,15 +244,7 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
       auto mutable_data = (*data_block)->mutable_data();
       std::copy(data.begin() + offset, data.begin() + offset + chunk_size, mutable_data.begin());
 
-      // Calculate and store hash
-      std::vector<uint8_t> hash(DeviceEncryption::DIGEST_SIZE);
-      DeviceEncryption::CalculateHash(
-          std::span<const std::byte>(mutable_data.data(), chunk_size),
-          std::span<std::byte>(reinterpret_cast<std::byte*>(hash.data()), hash.size())
-      );
-      block_hashes.push_back(std::move(hash));
-
-      // Block will be flushed when it goes out of scope
+      // Block will be flushed with correct hash_ref when it goes out of scope
     }
   } else if (category == 3 && !data.empty()) {
     // Category 3: Data in clusters (64 blocks each = 8 large blocks)
@@ -205,16 +252,21 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
 
     auto clusters = quota_->AllocDataBlocks(static_cast<uint32_t>(clusters_needed), BlockType::Cluster);
     if (!clusters.has_value()) {
+      std::string name_str(name);
+      map_.erase(name_str);
       return std::unexpected(clusters.error());
     }
     allocated_clusters = std::move(*clusters);
 
+    // Get pointer to cluster metadata in file metadata (reversed at end)
+    auto* cluster_meta_array = reinterpret_cast<DataBlocksClusterMetadata*>(metadata_end - clusters_needed * sizeof(DataBlocksClusterMetadata));
+
     // Write data to each cluster
     for (size_t cluster_idx = 0; cluster_idx < allocated_clusters.size(); ++cluster_idx) {
       size_t cluster_offset = cluster_idx * cluster_block_size;
-      size_t cluster_data_size = std::min(data.size() - cluster_offset, cluster_block_size);
-      
-      std::array<std::vector<uint8_t>, 8> cluster_hash_array;
+
+      // Set cluster block number in metadata (reversed order)
+      cluster_meta_array[clusters_needed - 1 - cluster_idx].block_number = allocated_clusters[cluster_idx];
 
       // Write data to each large block (8 blocks) in the cluster
       for (size_t lb_idx = 0; lb_idx < 8; ++lb_idx) {
@@ -226,49 +278,38 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
         }
 
         if (lb_data_size > 0) {
-          // Load the large block for writing
-          // Each cluster starts at allocated_clusters[cluster_idx]
-          // Large block index within cluster: lb_idx
-          // Block number = cluster_start + lb_idx * 8 (since large block = 8 single blocks)
           uint32_t lb_block_number = allocated_clusters[cluster_idx] + static_cast<uint32_t>(lb_idx << log2_size(BlockType::Large));
           
+          // Create hash_ref pointing to the hash location in cluster metadata
+          Block::HashRef hash_ref{file_metadata_block, 
+              file_metadata_block->to_offset(cluster_meta_array[clusters_needed - 1 - cluster_idx].hash[lb_idx])};
+
           auto data_block = quota_->LoadDataBlock(
               lb_block_number,
               static_cast<BlockSize>(quota_->block_size_log2()),
               BlockType::Large,
               static_cast<uint32_t>(lb_data_size),
-              {nullptr, 0},  // hash will be calculated on flush
-              true,  // encrypted
-              true   // new_block
+              hash_ref,  // Proper hash_ref now!
+              true,
+              true
           );
           if (!data_block.has_value()) {
-            // Rollback allocated clusters
             for (uint32_t blk : allocated_clusters) {
               quota_->DeleteBlocks(blk, 64);
             }
+            std::string name_str(name);
+            map_.erase(name_str);
             return std::unexpected(data_block.error());
           }
 
-          // Copy data to block
           auto mutable_data = (*data_block)->mutable_data();
           std::copy(data.begin() + lb_offset, data.begin() + lb_offset + lb_data_size, mutable_data.begin());
-
-          // Calculate and store hash for this large block
-          std::vector<uint8_t> hash(DeviceEncryption::DIGEST_SIZE);
-          DeviceEncryption::CalculateHash(
-              std::span<const std::byte>(mutable_data.data(), lb_data_size),
-              std::span<std::byte>(reinterpret_cast<std::byte*>(hash.data()), hash.size())
-          );
-          cluster_hash_array[lb_idx] = std::move(hash);
-
-          // Block will be flushed when it goes out of scope
+          // Block will be flushed with correct hash_ref when it goes out of scope
         } else {
           // Empty large block, hash is zeros
-          cluster_hash_array[lb_idx].resize(DeviceEncryption::DIGEST_SIZE, 0);
+          std::memset(cluster_meta_array[clusters_needed - 1 - cluster_idx].hash[lb_idx], 0, DeviceEncryption::DIGEST_SIZE);
         }
       }
-      
-      cluster_hashes.push_back(std::move(cluster_hash_array));
     }
   } else if (category == 4 && !data.empty()) {
     // Category 4: Indirect block lists for very large files
@@ -283,43 +324,61 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
     size_t metadata_blocks_needed = div_ceil(clusters_needed, clusters_per_metadata_block);
 
     // Allocate metadata blocks for cluster info
-    std::vector<uint32_t> allocated_metadata_blocks;
+    std::vector<std::shared_ptr<Block>> metadata_blocks;
+    std::vector<uint32_t> allocated_metadata_numbers;
     for (size_t i = 0; i < metadata_blocks_needed; ++i) {
-      auto meta_block = quota_->AllocMetadataBlock();
-      if (!meta_block.has_value()) {
-        // Rollback already allocated metadata blocks
-        for (uint32_t blk : allocated_metadata_blocks) {
+      auto meta_block_result = quota_->AllocMetadataBlock();
+      if (!meta_block_result.has_value()) {
+        for (uint32_t blk : allocated_metadata_numbers) {
           quota_->DeleteBlocks(blk, 1);
         }
-        return std::unexpected(meta_block.error());
+        std::string name_str(name);
+        map_.erase(name_str);
+        return std::unexpected(meta_block_result.error());
       }
-      uint32_t meta_block_number = quota_->to_area_block_number((*meta_block)->physical_block_number());
-      allocated_metadata_blocks.push_back(meta_block_number);
+      auto meta_block = *meta_block_result;
+      uint32_t meta_block_number = quota_->to_area_block_number(meta_block->physical_block_number());
+      allocated_metadata_numbers.push_back(meta_block_number);
       
-      // Initialize the metadata block header - no special flags needed for cluster list blocks
-      auto* header = (*meta_block)->get_mutable_object<MetadataBlockHeader>(0);
+      // Initialize the metadata block header
+      auto* header = meta_block->get_mutable_object<MetadataBlockHeader>(0);
       header->block_flags = 0;
       std::memset(header->hash, 0, sizeof(header->hash));
-      // Block will be flushed when it goes out of scope
+      
+      metadata_blocks.push_back(std::move(meta_block));
     }
 
     // Allocate clusters for data
     auto clusters = quota_->AllocDataBlocks(static_cast<uint32_t>(clusters_needed), BlockType::Cluster);
     if (!clusters.has_value()) {
-      // Rollback metadata blocks
-      for (uint32_t blk : allocated_metadata_blocks) {
+      for (uint32_t blk : allocated_metadata_numbers) {
         quota_->DeleteBlocks(blk, 1);
       }
+      std::string name_str(name);
+      map_.erase(name_str);
       return std::unexpected(clusters.error());
     }
     allocated_clusters = std::move(*clusters);
 
-    // Write data to each cluster and store cluster info in metadata blocks
+    // Set metadata block numbers in file metadata (reversed at end)
+    auto* meta_block_ptr_array = reinterpret_cast<uint32_be_t*>(metadata_end - metadata_blocks_needed * sizeof(uint32_be_t));
+    for (size_t i = 0; i < metadata_blocks_needed; ++i) {
+      meta_block_ptr_array[metadata_blocks_needed - 1 - i] = allocated_metadata_numbers[i];
+    }
+
+    // Write data to each cluster
     for (size_t cluster_idx = 0; cluster_idx < allocated_clusters.size(); ++cluster_idx) {
       size_t cluster_offset = cluster_idx * cluster_block_size;
-      size_t cluster_data_size = std::min(data.size() - cluster_offset, cluster_block_size);
+      size_t meta_block_idx = cluster_idx / clusters_per_metadata_block;
+      size_t cluster_in_block_idx = cluster_idx % clusters_per_metadata_block;
       
-      std::array<std::vector<uint8_t>, 8> cluster_hash_array;
+      // Get the cluster metadata entry in the appropriate metadata block
+      auto& cluster_meta_block = metadata_blocks[meta_block_idx];
+      auto* cluster_meta_array = cluster_meta_block->get_mutable_object<DataBlocksClusterMetadata>(sizeof(MetadataBlockHeader));
+      DataBlocksClusterMetadata* cluster_meta = &cluster_meta_array[cluster_in_block_idx];
+      
+      // Set cluster block number
+      cluster_meta->block_number = allocated_clusters[cluster_idx];
 
       // Write data to each large block (8 blocks) in the cluster
       for (size_t lb_idx = 0; lb_idx < 8; ++lb_idx) {
@@ -333,195 +392,50 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
         if (lb_data_size > 0) {
           uint32_t lb_block_number = allocated_clusters[cluster_idx] + static_cast<uint32_t>(lb_idx << log2_size(BlockType::Large));
           
+          // Create hash_ref pointing to the hash location in cluster metadata block
+          Block::HashRef hash_ref{cluster_meta_block, cluster_meta_block->to_offset(cluster_meta->hash[lb_idx])};
+
           auto data_block = quota_->LoadDataBlock(
               lb_block_number,
               static_cast<BlockSize>(quota_->block_size_log2()),
               BlockType::Large,
               static_cast<uint32_t>(lb_data_size),
-              {nullptr, 0},
+              hash_ref,  // Proper hash_ref now!
               true,
               true
           );
           if (!data_block.has_value()) {
-            // Rollback
-            for (uint32_t blk : allocated_metadata_blocks) {
+            for (uint32_t blk : allocated_metadata_numbers) {
               quota_->DeleteBlocks(blk, 1);
             }
             for (uint32_t blk : allocated_clusters) {
               quota_->DeleteBlocks(blk, 64);
             }
+            std::string name_str(name);
+            map_.erase(name_str);
             return std::unexpected(data_block.error());
           }
 
           auto mutable_data = (*data_block)->mutable_data();
           std::copy(data.begin() + lb_offset, data.begin() + lb_offset + lb_data_size, mutable_data.begin());
-
-          std::vector<uint8_t> hash(DeviceEncryption::DIGEST_SIZE);
-          DeviceEncryption::CalculateHash(
-              std::span<const std::byte>(mutable_data.data(), lb_data_size),
-              std::span<std::byte>(reinterpret_cast<std::byte*>(hash.data()), hash.size())
-          );
-          cluster_hash_array[lb_idx] = std::move(hash);
+          // Block will be flushed with correct hash_ref
         } else {
-          cluster_hash_array[lb_idx].resize(DeviceEncryption::DIGEST_SIZE, 0);
+          // Empty large block, hash is zeros
+          std::memset(cluster_meta->hash[lb_idx], 0, DeviceEncryption::DIGEST_SIZE);
         }
       }
-      
-      cluster_hashes.push_back(std::move(cluster_hash_array));
-
-      // Store cluster info in the appropriate metadata block
-      size_t meta_block_idx = cluster_idx / clusters_per_metadata_block;
-      size_t cluster_in_block_idx = cluster_idx % clusters_per_metadata_block;
-      
-      // Load the metadata block for writing
-      auto meta_block = quota_->LoadMetadataBlock(allocated_metadata_blocks[meta_block_idx]);
-      if (!meta_block.has_value()) {
-        for (uint32_t blk : allocated_metadata_blocks) {
-          quota_->DeleteBlocks(blk, 1);
-        }
-        for (uint32_t blk : allocated_clusters) {
-          quota_->DeleteBlocks(blk, 64);
-        }
-        return std::unexpected(meta_block.error());
-      }
-      
-      // Write cluster info to metadata block
-      auto* clusters_array = (*meta_block)->get_mutable_object<DataBlocksClusterMetadata>(sizeof(MetadataBlockHeader));
-      DataBlocksClusterMetadata* cluster_meta = &clusters_array[cluster_in_block_idx];
-      cluster_meta->block_number = allocated_clusters[cluster_idx];
-      for (size_t j = 0; j < 8; ++j) {
-        std::memcpy(cluster_meta->hash[j], cluster_hashes.back()[j].data(), DeviceEncryption::DIGEST_SIZE);
-      }
-      // Block will be flushed when it goes out of scope
     }
     
-    // Store metadata block numbers for later use in file metadata
-    block_hashes.clear();  // Reuse for metadata block numbers stored as hash-sized data
-    for (uint32_t meta_blk : allocated_metadata_blocks) {
-      std::vector<uint8_t> meta_info(DeviceEncryption::DIGEST_SIZE, 0);
-      // Store the block number in the first 4 bytes
-      std::memcpy(meta_info.data(), &meta_blk, sizeof(uint32_t));
-      block_hashes.push_back(std::move(meta_info));
-    }
-    allocated_blocks = std::move(allocated_metadata_blocks);  // Reuse for rollback
+    allocated_blocks = std::move(allocated_metadata_numbers);
+  } else if (category == 0) {
+    // Category 0: data stored directly in metadata (no separate blocks)
+    // Copy data to the metadata area after EntryMetadata
+    // Data starts right after EntryMetadata's case_bitmap
+    std::byte* data_dest = reinterpret_cast<std::byte*>(file->mutable_metadata()) + base_metadata_size;
+    std::copy(data.begin(), data.end(), data_dest);
   }
 
-  // Create EntryMetadata
-  EntryMetadata metadata{};
-  std::memset(&metadata, 0, sizeof(metadata));
-  metadata.flags = 0;  // Regular file (no DIRECTORY flag)
-  metadata.size_on_disk = size_on_disk;
-  metadata.file_size = size_on_disk;
-  metadata.size_category = category;
-  metadata.ctime = static_cast<uint32_t>(std::time(nullptr));
-  metadata.mtime = metadata.ctime;
-  metadata.directory_block_number = 0;
-  metadata.permissions.owner = 0;
-  metadata.permissions.group = 0;
-  metadata.permissions.mode = 0644;  // Default file permissions
-  metadata.filename_length = static_cast<uint8_t>(lowercase_name.size());
-  metadata.metadata_log2_size = static_cast<uint8_t>(std::bit_width(aligned_metadata_size - 1));
-
-  // Build case bitmap: uppercase letters have their bit set
-  uint8_t case_bitmap = 0;
-  for (size_t i = 0; i < name.size(); ++i) {
-    if (std::isupper(static_cast<unsigned char>(name[i]))) {
-      case_bitmap |= (1 << (i % 8));
-    }
-    if (i % 8 == 7) {
-      break;
-    }
-  }
-  metadata.case_bitmap = case_bitmap;
-
-  // Note: For category 0, data is stored after EntryMetadata in the same allocation
-  // For category 1+, DataBlockMetadata list is stored after EntryMetadata
-  // The actual data block info needs to be written after the base metadata
-  // This is handled by the DirectoryMap::insert which copies the metadata
-
-  // For now, we need to handle this differently - we need to allocate space in the directory tree
-  // that includes the data block metadata
-
-  // Insert into directory map
-  if (!map_.insert(lowercase_name, &metadata)) {
-    // Rollback allocated blocks
-    for (uint32_t blk : allocated_blocks) {
-      quota_->DeleteBlocks(blk, 1);
-    }
-    // Rollback allocated clusters for category 3
-    for (uint32_t blk : allocated_clusters) {
-      quota_->DeleteBlocks(blk, 64);
-    }
-    // For category 4, also need to delete clusters (allocated_clusters is used)
-    // and allocated_blocks contains metadata block numbers which are already handled above
-    return std::unexpected(WfsError::kNoSpace);
-  }
-
-  // After successful insert, we need to update the metadata with block info
-  // Re-fetch the entry to get the actual metadata location
-  auto entry_result = GetFile(name);
-  if (!entry_result.has_value()) {
-    return std::unexpected(entry_result.error());
-  }
-
-  auto file = entry_result.value();
-  EntryMetadata* file_metadata = file->mutable_metadata();
-
-  // Write data block info to metadata for category 1+
-  if (category >= 1 && category <= 2 && !allocated_blocks.empty()) {
-    // The DataBlockMetadata array is stored at the end of the metadata, reversed
-    size_t blocks_count = allocated_blocks.size();
-    std::byte* metadata_end = reinterpret_cast<std::byte*>(file_metadata) + aligned_metadata_size;
-
-    // DataBlockMetadata is stored reversed at the end of metadata
-    for (size_t i = 0; i < blocks_count; ++i) {
-      DataBlockMetadata* block_meta = reinterpret_cast<DataBlockMetadata*>(
-          metadata_end - (i + 1) * sizeof(DataBlockMetadata)
-      );
-      block_meta->block_number = allocated_blocks[i];
-      std::memcpy(block_meta->hash, block_hashes[i].data(), DeviceEncryption::DIGEST_SIZE);
-    }
-  }
-
-  // Write cluster info to metadata for category 3
-  if (category == 3 && !allocated_clusters.empty()) {
-    size_t clusters_count = allocated_clusters.size();
-    std::byte* metadata_end = reinterpret_cast<std::byte*>(file_metadata) + aligned_metadata_size;
-
-    // DataBlocksClusterMetadata is stored reversed at the end of metadata
-    for (size_t i = 0; i < clusters_count; ++i) {
-      DataBlocksClusterMetadata* cluster_meta = reinterpret_cast<DataBlocksClusterMetadata*>(
-          metadata_end - (i + 1) * sizeof(DataBlocksClusterMetadata)
-      );
-      cluster_meta->block_number = allocated_clusters[i];
-      // Copy 8 hashes for each large block in the cluster
-      for (size_t j = 0; j < 8; ++j) {
-        std::memcpy(cluster_meta->hash[j], cluster_hashes[i][j].data(), DeviceEncryption::DIGEST_SIZE);
-      }
-    }
-  }
-
-  // Write metadata block numbers for category 4
-  if (category == 4 && !allocated_blocks.empty()) {
-    // allocated_blocks now contains metadata block numbers
-    size_t meta_blocks_count = allocated_blocks.size();
-    std::byte* metadata_end = reinterpret_cast<std::byte*>(file_metadata) + aligned_metadata_size;
-
-    // uint32_be_t (metadata block numbers) is stored reversed at the end of metadata
-    for (size_t i = 0; i < meta_blocks_count; ++i) {
-      uint32_be_t* meta_block_ptr = reinterpret_cast<uint32_be_t*>(
-          metadata_end - (i + 1) * sizeof(uint32_be_t)
-      );
-      *meta_block_ptr = allocated_blocks[i];
-    }
-  }
-
-  // For category 0, copy data directly after base metadata
-  if (category == 0 && !data.empty()) {
-    std::byte* data_start = reinterpret_cast<std::byte*>(file_metadata) + base_metadata_size;
-    std::copy(data.begin(), data.end(), data_start);
-  }
-
+  // Return the file (already created and metadata written)
   return file;
 }
 

@@ -78,15 +78,30 @@ target_include_directories(${PROJECT_NAME}
         ${CMAKE_CURRENT_SOURCE_DIR}/include/wfslib
 )
 
-find_package(Boost 1.64.0 REQUIRED)
-find_package(cryptopp REQUIRED)
+# Try to find packages, fallback to system libraries
+find_package(Boost 1.64.0 COMPONENTS iostreams filesystem system QUIET)
+find_package(cryptopp QUIET)
 
-target_link_libraries(${PROJECT_NAME}
-    PUBLIC
-        Boost::boost
-    PRIVATE
-        cryptopp::cryptopp
-)
+if(Boost_FOUND AND cryptopp_FOUND)
+    target_link_libraries(${PROJECT_NAME}
+        PUBLIC
+            Boost::boost
+        PRIVATE
+            cryptopp::cryptopp
+    )
+else()
+    # Fallback to system libraries
+    message(STATUS "Using system libraries (not found via find_package)")
+    target_include_directories(${PROJECT_NAME} PRIVATE /usr/include)
+    target_link_libraries(${PROJECT_NAME}
+        PUBLIC
+            /usr/lib/x86_64-linux-gnu/libboost_iostreams.a
+            /usr/lib/x86_64-linux-gnu/libboost_filesystem.a
+            /usr/lib/x86_64-linux-gnu/libboost_system.a
+        PRIVATE
+            /usr/lib/x86_64-linux-gnu/libcrypto++.a
+    )
+endif()
 
 if(CONFIG STREQUAL "Release" AND NOT MSVC)
     target_link_libraries(${PROJECT_NAME} PUBLIC -s)
