@@ -78,9 +78,19 @@ void Block::Flush() {
   if (detached_ || !dirty_)
     return;
   if (data_.size() > 0) {
-    device_->WriteBlock(physical_block_number_, 1 << (log2_size() - ::log2_size(BlockSize::Physical)), data_,
-                        {mutable_hash(), DeviceEncryption::DIGEST_SIZE}, iv_, encrypted_,
-                        /*recalculate_hash=*/true);
+    // For data blocks (hash_ref_ is null), don't write hash into data itself
+    // Hash is stored externally in file metadata
+    bool has_external_hash = hash_ref_.block != nullptr || hash_ref_.offset != 0;
+    if (has_external_hash) {
+      device_->WriteBlock(physical_block_number_, 1 << (log2_size() - ::log2_size(BlockSize::Physical)), data_,
+                          {mutable_hash(), DeviceEncryption::DIGEST_SIZE}, iv_, encrypted_,
+                          /*recalculate_hash=*/true);
+    } else {
+      // No external hash storage, just write the data without hash calculation
+      device_->WriteBlock(physical_block_number_, 1 << (log2_size() - ::log2_size(BlockSize::Physical)), data_,
+                          {}, iv_, encrypted_,
+                          /*recalculate_hash=*/false);
+    }
   }
   dirty_ = false;
 }
@@ -108,12 +118,19 @@ std::expected<std::shared_ptr<Block>, WfsError> Block::LoadDataBlock(std::shared
                                                                      bool check_hash) {
   auto cached_block = device->GetFromCache(physical_block_number);
   if (cached_block) {
-    assert(cached_block->physical_block_number() == physical_block_number);
-    assert(cached_block->block_size() == block_size);
-    assert(cached_block->block_type() == block_type);
-    assert(cached_block->size() == data_size);
-    assert(cached_block->encrypted() == encrypted);
-    return cached_block;
+    // If this is a new block (load_data=false), remove the old cached block
+    if (!load_data) {
+      cached_block->Flush();
+      device->RemoveFromCache(physical_block_number);
+      cached_block.reset();
+    } else {
+      assert(cached_block->physical_block_number() == physical_block_number);
+      assert(cached_block->block_size() == block_size);
+      assert(cached_block->block_type() == block_type);
+      assert(cached_block->size() == data_size);
+      assert(cached_block->encrypted() == encrypted);
+      return cached_block;
+    }
   }
   auto block = std::make_shared<Block>(device, physical_block_number, block_size, block_type, data_size, iv,
                                        std::move(data_hash), encrypted);
