@@ -342,3 +342,170 @@ std::expected<std::shared_ptr<Directory>, WfsError> Directory::CreateDirectory(s
   // Return the newly created directory
   return GetDirectory(name);
 }
+
+std::expected<void, WfsError> Directory::DeleteFile(std::string_view name) {
+  // Find the entry
+  auto it = find(name);
+  if (it.is_end()) {
+    return std::unexpected(WfsError::kEntryNotFound);
+  }
+
+  auto entry_opt = (*it).entry;
+  if (!entry_opt.has_value() || !entry_opt.value()->is_file()) {
+    return std::unexpected(WfsError::kNotFile);
+  }
+
+  auto file = std::dynamic_pointer_cast<File>(entry_opt.value());
+  uint8_t category = file->metadata()->size_category.value();
+
+  // Get block size info
+  size_t block_size = quota_->block_size();
+  size_t large_block_size = block_size << log2_size(BlockType::Large);   // 8 blocks
+  size_t cluster_block_size = block_size << log2_size(BlockType::Cluster);  // 64 blocks
+
+  // Free data blocks based on category
+  if (category >= 1 && category <= 2) {
+    // Category 1-2: Data in single or large blocks
+    BlockType block_type = (category == 1) ? BlockType::Single : BlockType::Large;
+    size_t data_block_size = (category == 1) ? block_size : large_block_size;
+    size_t blocks_count = div_ceil(file->Size(), data_block_size);
+
+    // Get the metadata location
+    size_t aligned_size = size_t{1} << file->metadata()->metadata_log2_size.value();
+    std::byte* metadata_end = reinterpret_cast<std::byte*>(file->mutable_metadata()) + aligned_size;
+
+    // DataBlockMetadata is stored reversed at the end of metadata
+    for (size_t i = 0; i < blocks_count; ++i) {
+      DataBlockMetadata* block_meta = reinterpret_cast<DataBlockMetadata*>(
+          metadata_end - (i + 1) * sizeof(DataBlockMetadata)
+      );
+      uint32_t block_number = block_meta->block_number.value();
+      uint32_t blocks_to_delete = (block_type == BlockType::Large) ? 8 : 1;
+      quota_->DeleteBlocks(block_number, blocks_to_delete);
+    }
+  } else if (category == 3) {
+    // Category 3: Data in clusters
+    size_t clusters_count = div_ceil(file->Size(), cluster_block_size);
+
+    size_t aligned_size = size_t{1} << file->metadata()->metadata_log2_size.value();
+    std::byte* metadata_end = reinterpret_cast<std::byte*>(file->mutable_metadata()) + aligned_size;
+
+    for (size_t i = 0; i < clusters_count; ++i) {
+      DataBlocksClusterMetadata* cluster_meta = reinterpret_cast<DataBlocksClusterMetadata*>(
+          metadata_end - (i + 1) * sizeof(DataBlocksClusterMetadata)
+      );
+      uint32_t block_number = cluster_meta->block_number.value();
+      // A cluster is 64 blocks
+      quota_->DeleteBlocks(block_number, 64);
+    }
+  } else if (category == 4) {
+    // Category 4: Indirect block lists
+    size_t clusters_per_block = (block_size - sizeof(MetadataBlockHeader)) / sizeof(DataBlocksClusterMetadata);
+    clusters_per_block = std::min(clusters_per_block, size_t{48});
+    size_t clusters_count = div_ceil(file->Size(), cluster_block_size);
+    size_t metadata_blocks_count = div_ceil(clusters_count, clusters_per_block);
+
+    size_t aligned_size = size_t{1} << file->metadata()->metadata_log2_size.value();
+    std::byte* metadata_end = reinterpret_cast<std::byte*>(file->mutable_metadata()) + aligned_size;
+
+    // Get the list of metadata block numbers
+    for (size_t meta_idx = 0; meta_idx < metadata_blocks_count; ++meta_idx) {
+      uint32_be_t* meta_block_ptr = reinterpret_cast<uint32_be_t*>(
+          metadata_end - (meta_idx + 1) * sizeof(uint32_be_t)
+      );
+      uint32_t meta_block_number = meta_block_ptr->value();
+
+      // Load the metadata block to get cluster info
+      auto meta_block = quota_->LoadMetadataBlock(meta_block_number);
+      if (!meta_block.has_value()) {
+        continue;  // Skip corrupted metadata block
+      }
+
+      // Get clusters from this metadata block
+      size_t clusters_in_this_block = std::min(clusters_count - meta_idx * clusters_per_block, clusters_per_block);
+      auto* clusters = (*meta_block)->get_object<DataBlocksClusterMetadata>(sizeof(MetadataBlockHeader));
+
+      for (size_t cluster_idx = 0; cluster_idx < clusters_in_this_block; ++cluster_idx) {
+        uint32_t block_number = clusters[cluster_idx].block_number.value();
+        quota_->DeleteBlocks(block_number, 64);
+      }
+
+      // Delete the metadata block itself
+      quota_->DeleteBlocks(meta_block_number, 1);
+    }
+  }
+  // Category 0: Data is inline in metadata, no separate blocks to free
+
+  // Remove from directory map
+  std::string name_str(name);
+  if (!map_.erase(name_str)) {
+    return std::unexpected(WfsError::kEntryNotFound);
+  }
+
+  return {};
+}
+
+std::expected<void, WfsError> Directory::DeleteDirectory(std::string_view name, bool recursive) {
+  // Find the entry
+  auto it = find(name);
+  if (it.is_end()) {
+    return std::unexpected(WfsError::kEntryNotFound);
+  }
+
+  auto entry_opt = (*it).entry;
+  if (!entry_opt.has_value() || !entry_opt.value()->is_directory()) {
+    return std::unexpected(WfsError::kNotDirectory);
+  }
+
+  auto dir = std::dynamic_pointer_cast<Directory>(entry_opt.value());
+
+  // Check if directory is empty
+  if (!dir->empty()) {
+    if (!recursive) {
+      return std::unexpected(WfsError::kDirectoryNotEmpty);
+    }
+
+    // Recursive delete: delete all contents first
+    // Collect all entry names first to avoid iterator invalidation
+    std::vector<std::string> entries_to_delete;
+    for (const auto& item : *dir) {
+      if (item.entry.has_value()) {
+        entries_to_delete.push_back(std::string(item.name));
+      }
+    }
+
+    // Delete each entry
+    for (const auto& entry_name : entries_to_delete) {
+      auto sub_entry = dir->GetEntry(entry_name);
+      if (!sub_entry.has_value()) {
+        continue;
+      }
+
+      if ((*sub_entry)->is_directory()) {
+        auto result = dir->DeleteDirectory(entry_name, true);
+        if (!result.has_value()) {
+          return result;
+        }
+      } else if ((*sub_entry)->is_file()) {
+        auto result = dir->DeleteFile(entry_name);
+        if (!result.has_value()) {
+          return result;
+        }
+      }
+    }
+  }
+
+  // Get the directory block number
+  uint32_t dir_block_number = dir->metadata()->directory_block_number.value();
+
+  // Remove from directory map
+  std::string name_str(name);
+  if (!map_.erase(name_str)) {
+    return std::unexpected(WfsError::kEntryNotFound);
+  }
+
+  // Free the directory block
+  quota_->DeleteBlocks(dir_block_number, 1);
+
+  return {};
+}

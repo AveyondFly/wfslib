@@ -35,6 +35,8 @@ char const* WfsException::what() const noexcept {
       return "Invalid WFS version";
     case WfsError::kNoSpace:
       return "Not enough free space";
+    case WfsError::kDirectoryNotEmpty:
+      return "Directory not empty";
   }
   return "";
 }

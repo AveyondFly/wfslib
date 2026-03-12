@@ -47,6 +47,18 @@ class Directory : public Entry, public std::enable_shared_from_this<Directory> {
   // Create a new empty directory in this directory
   std::expected<std::shared_ptr<Directory>, WfsError> CreateDirectory(std::string_view name);
 
+  // Delete a file from this directory
+  // Returns true if the file was deleted, false if not found
+  std::expected<void, WfsError> DeleteFile(std::string_view name);
+
+  // Delete a directory from this directory
+  // If recursive is true, deletes all contents recursively
+  // If recursive is false, only deletes empty directories
+  std::expected<void, WfsError> DeleteDirectory(std::string_view name, bool recursive = false);
+
+  // Check if the directory is empty
+  bool empty() const { return map_.size() == 0; }
+
   const std::shared_ptr<QuotaArea>& quota() const { return quota_; }
 
  private:
