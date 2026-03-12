@@ -7,6 +7,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
+#include <catch2/matchers/catch_matchers.hpp>
 
 #include <filesystem>
 #include <fstream>
@@ -421,5 +422,221 @@ TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Directory operations") {
     REQUIRE(root->CreateDirectory("dup_dir").has_value());
     auto second = root->CreateDirectory("dup_dir");
     REQUIRE_FALSE(second.has_value());
+  }
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Multi-file serial write") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Serial write of files with different sizes (covering all categories)
+  struct TestFile {
+    std::string name;
+    size_t size;
+    uint8_t seed;
+  };
+
+  std::vector<TestFile> test_files = {
+    {"empty.dat", 0, 0x00},
+    {"tiny.dat", 50, 0x01},
+    {"small.dat", 500, 0x02},
+    {"block1.dat", kBlockSize, 0x03},
+    {"block2.dat", kBlockSize * 2, 0x04},
+    {"block5.dat", kBlockSize * 5, 0x05},                    // Max cat1
+    {"large1.dat", kLargeBlockSize, 0x06},                   // Cat2
+    {"large3.dat", kLargeBlockSize * 3, 0x07},
+    {"large5.dat", kLargeBlockSize * 5, 0x08},               // Max cat2
+    {"cluster1.dat", kClusterSize, 0x09},                    // Cat3
+    {"cluster2.dat", kClusterSize * 2, 0x0A},
+    {"cluster4.dat", kClusterSize * 4, 0x0B},                // Max cat3
+  };
+
+  // Write all files serially
+  for (const auto& tf : test_files) {
+    auto data = MakeTestData(tf.size, tf.seed);
+    auto result = root->CreateFile(tf.name, data);
+    INFO("Failed to create: " << tf.name);
+    REQUIRE(result.has_value());
+  }
+
+  // Verify all files can be read correctly
+  for (const auto& tf : test_files) {
+    auto file = root->GetFile(tf.name);
+    INFO("Failed to get: " << tf.name);
+    REQUIRE(file.has_value());
+
+    auto expected = MakeTestData(tf.size, tf.seed);
+    auto read_data = ReadFileData(file.value());
+    INFO("Data mismatch: " << tf.name);
+    REQUIRE(read_data == expected);
+  }
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Nested directories with files") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Create nested directory structure
+  auto level1 = root->CreateDirectory("level1");
+  REQUIRE(level1.has_value());
+
+  auto level2 = level1.value()->CreateDirectory("level2");
+  REQUIRE(level2.has_value());
+
+  auto level3 = level2.value()->CreateDirectory("level3");
+  REQUIRE(level3.has_value());
+
+  // Create files at each level
+  auto data_root = MakeTestData(100, 0x01);
+  auto data_l1 = MakeTestData(kBlockSize, 0x02);
+  auto data_l2 = MakeTestData(kLargeBlockSize, 0x03);
+  auto data_l3 = MakeTestData(kClusterSize, 0x04);
+
+  REQUIRE(root->CreateFile("root_file.dat", data_root).has_value());
+  REQUIRE(level1.value()->CreateFile("l1_file.dat", data_l1).has_value());
+  REQUIRE(level2.value()->CreateFile("l2_file.dat", data_l2).has_value());
+  REQUIRE(level3.value()->CreateFile("l3_file.dat", data_l3).has_value());
+
+  // Verify all files
+  REQUIRE(ReadFileData(root->GetFile("root_file.dat").value()) == data_root);
+  REQUIRE(ReadFileData(level1.value()->GetFile("l1_file.dat").value()) == data_l1);
+  REQUIRE(ReadFileData(level2.value()->GetFile("l2_file.dat").value()) == data_l2);
+  REQUIRE(ReadFileData(level3.value()->GetFile("l3_file.dat").value()) == data_l3);
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Delete and recreate files") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Create a file
+  auto data1 = MakeTestData(kBlockSize * 2, 0x10);
+  REQUIRE(root->CreateFile("recycle.bin", data1).has_value());
+  REQUIRE(ReadFileData(root->GetFile("recycle.bin").value()) == data1);
+
+  // Delete it
+  REQUIRE(root->DeleteFile("recycle.bin").has_value());
+  REQUIRE_FALSE(root->GetFile("recycle.bin").has_value());
+
+  // Recreate with different data
+  auto data2 = MakeTestData(kLargeBlockSize, 0x20);
+  REQUIRE(root->CreateFile("recycle.bin", data2).has_value());
+  REQUIRE(ReadFileData(root->GetFile("recycle.bin").value()) == data2);
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Many small files") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Create 50 small files
+  const int num_files = 50;
+  for (int i = 0; i < num_files; ++i) {
+    std::string name = "file_" + std::to_string(i) + ".dat";
+    auto data = MakeTestData(100 + i, static_cast<uint8_t>(i));
+    auto result = root->CreateFile(name, data);
+    INFO("Failed at file " << i);
+    REQUIRE(result.has_value());
+  }
+
+  // Verify all
+  for (int i = 0; i < num_files; ++i) {
+    std::string name = "file_" + std::to_string(i) + ".dat";
+    auto file = root->GetFile(name);
+    REQUIRE(file.has_value());
+
+    auto expected = MakeTestData(100 + i, static_cast<uint8_t>(i));
+    REQUIRE(ReadFileData(file.value()) == expected);
+  }
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Mixed file operations") {
+  // Need larger image
+  Cleanup();
+  CreateImage(128 * 1024 * 1024);
+
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Create directories
+  auto docs = root->CreateDirectory("documents");
+  auto pics = root->CreateDirectory("pictures");
+  REQUIRE(docs.has_value());
+  REQUIRE(pics.has_value());
+
+  // Create various files
+  auto cat0_data = MakeTestData(200, 0xA0);
+  auto cat1_data = MakeTestData(kBlockSize * 3, 0xA1);
+  auto cat2_data = MakeTestData(kLargeBlockSize * 2, 0xA2);
+  auto cat3_data = MakeTestData(kClusterSize * 2, 0xA3);
+  auto cat4_data = MakeTestData(kClusterSize * 6, 0xA4);
+
+  REQUIRE(root->CreateFile("cat0.bin", cat0_data).has_value());
+  REQUIRE(docs.value()->CreateFile("cat1.bin", cat1_data).has_value());
+  REQUIRE(docs.value()->CreateFile("cat2.bin", cat2_data).has_value());
+  REQUIRE(pics.value()->CreateFile("cat3.bin", cat3_data).has_value());
+  REQUIRE(pics.value()->CreateFile("cat4.bin", cat4_data).has_value());
+
+  // Flush and reopen
+  wfs->Flush();
+  wfs = OpenWfs();
+  REQUIRE(wfs);
+  root = wfs->GetRootDirectory().value();
+
+  // Verify everything after reopen
+  docs = root->GetDirectory("documents");
+  pics = root->GetDirectory("pictures");
+  REQUIRE(docs.has_value());
+  REQUIRE(pics.has_value());
+
+  REQUIRE(ReadFileData(root->GetFile("cat0.bin").value()) == cat0_data);
+  REQUIRE(ReadFileData(docs.value()->GetFile("cat1.bin").value()) == cat1_data);
+  REQUIRE(ReadFileData(docs.value()->GetFile("cat2.bin").value()) == cat2_data);
+  REQUIRE(ReadFileData(pics.value()->GetFile("cat3.bin").value()) == cat3_data);
+  REQUIRE(ReadFileData(pics.value()->GetFile("cat4.bin").value()) == cat4_data);
+
+  // Delete some files
+  REQUIRE(root->DeleteFile("cat0.bin").has_value());
+  REQUIRE(docs.value()->DeleteFile("cat1.bin").has_value());
+
+  // Verify deleted
+  REQUIRE_FALSE(root->GetFile("cat0.bin").has_value());
+  REQUIRE_FALSE(docs.value()->GetFile("cat1.bin").has_value());
+
+  // Others still exist
+  REQUIRE(docs.value()->GetFile("cat2.bin").has_value());
+  REQUIRE(pics.value()->GetFile("cat3.bin").has_value());
+  REQUIRE(pics.value()->GetFile("cat4.bin").has_value());
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Partial block writes") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Test various non-aligned sizes
+  std::vector<size_t> test_sizes = {
+    kBlockSize + 1,
+    kBlockSize + 1000,
+    kBlockSize * 2 + 1234,
+    kLargeBlockSize + 5000,
+    kLargeBlockSize * 2 + 10000,
+    kClusterSize + kBlockSize * 3,
+  };
+
+  for (size_t i = 0; i < test_sizes.size(); ++i) {
+    std::string name = "partial_" + std::to_string(i) + ".bin";
+    auto data = MakeTestData(test_sizes[i], static_cast<uint8_t>(i));
+
+    auto result = root->CreateFile(name, data);
+    INFO("Failed at size " << test_sizes[i]);
+    REQUIRE(result.has_value());
+
+    auto read = ReadFileData(result.value());
+    INFO("Mismatch at size " << test_sizes[i]);
+    REQUIRE(read == data);
   }
 }
