@@ -11,6 +11,7 @@
 #include <ranges>
 
 #include "directory.h"
+#include "directory_map.h"
 #include "free_blocks_allocator.h"
 #include "utils.h"
 #include "wfs_device.h"
@@ -182,7 +183,17 @@ void QuotaArea::Init(std::shared_ptr<Area> parent_area,
                                        : header->remainder_blocks_count.value());
   free_blocks_allocator->Init(std::move(quota_free_blocks));
 
-  // TODO: Initialize:
-  // 1. Root directory
-  // 2. shadow directories
+  // Initialize root directory
+  auto root_dir_block = throw_if_error(LoadMetadataBlock(kRootDirectoryBlockNumber, /*new_block=*/true));
+  DirectoryMap root_dir_map(shared_from_this(), std::move(root_dir_block));
+  root_dir_map.Init();
+
+  // Initialize shadow directories
+  auto shadow_dir1_block = throw_if_error(LoadMetadataBlock(kShadowDirectory1BlockNumber, /*new_block=*/true));
+  DirectoryMap shadow_dir1_map(shared_from_this(), std::move(shadow_dir1_block));
+  shadow_dir1_map.Init();
+
+  auto shadow_dir2_block = throw_if_error(LoadMetadataBlock(kShadowDirectory2BlockNumber, /*new_block=*/true));
+  DirectoryMap shadow_dir2_map(shared_from_this(), std::move(shadow_dir2_block));
+  shadow_dir2_map.Init();
 }
