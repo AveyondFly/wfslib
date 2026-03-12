@@ -147,6 +147,10 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
   std::vector<uint32_t> allocated_blocks;
   std::vector<std::vector<uint8_t>> block_hashes;
 
+  // For Category 3: clusters info
+  std::vector<uint32_t> allocated_clusters;
+  std::vector<std::array<std::vector<uint8_t>, 8>> cluster_hashes;
+
   if (category >= 1 && category <= 2 && !data.empty()) {
     BlockType block_type = (category == 1) ? BlockType::Single : BlockType::Large;
     size_t data_block_size = (category == 1) ? block_size : large_block_size;
@@ -195,6 +199,77 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
 
       // Block will be flushed when it goes out of scope
     }
+  } else if (category == 3 && !data.empty()) {
+    // Category 3: Data in clusters (64 blocks each = 8 large blocks)
+    size_t clusters_needed = div_ceil(data.size(), cluster_block_size);
+
+    auto clusters = quota_->AllocDataBlocks(static_cast<uint32_t>(clusters_needed), BlockType::Cluster);
+    if (!clusters.has_value()) {
+      return std::unexpected(clusters.error());
+    }
+    allocated_clusters = std::move(*clusters);
+
+    // Write data to each cluster
+    for (size_t cluster_idx = 0; cluster_idx < allocated_clusters.size(); ++cluster_idx) {
+      size_t cluster_offset = cluster_idx * cluster_block_size;
+      size_t cluster_data_size = std::min(data.size() - cluster_offset, cluster_block_size);
+      
+      std::array<std::vector<uint8_t>, 8> cluster_hash_array;
+
+      // Write data to each large block (8 blocks) in the cluster
+      for (size_t lb_idx = 0; lb_idx < 8; ++lb_idx) {
+        size_t lb_offset = cluster_offset + lb_idx * large_block_size;
+        size_t lb_data_size = 0;
+        
+        if (lb_offset < data.size()) {
+          lb_data_size = std::min(data.size() - lb_offset, large_block_size);
+        }
+
+        if (lb_data_size > 0) {
+          // Load the large block for writing
+          // Each cluster starts at allocated_clusters[cluster_idx]
+          // Large block index within cluster: lb_idx
+          // Block number = cluster_start + lb_idx * 8 (since large block = 8 single blocks)
+          uint32_t lb_block_number = allocated_clusters[cluster_idx] + static_cast<uint32_t>(lb_idx << log2_size(BlockType::Large));
+          
+          auto data_block = quota_->LoadDataBlock(
+              lb_block_number,
+              static_cast<BlockSize>(quota_->block_size_log2()),
+              BlockType::Large,
+              static_cast<uint32_t>(lb_data_size),
+              {nullptr, 0},  // hash will be calculated on flush
+              true,  // encrypted
+              true   // new_block
+          );
+          if (!data_block.has_value()) {
+            // Rollback allocated clusters
+            for (uint32_t blk : allocated_clusters) {
+              quota_->DeleteBlocks(blk, 64);
+            }
+            return std::unexpected(data_block.error());
+          }
+
+          // Copy data to block
+          auto mutable_data = (*data_block)->mutable_data();
+          std::copy(data.begin() + lb_offset, data.begin() + lb_offset + lb_data_size, mutable_data.begin());
+
+          // Calculate and store hash for this large block
+          std::vector<uint8_t> hash(DeviceEncryption::DIGEST_SIZE);
+          DeviceEncryption::CalculateHash(
+              std::span<const std::byte>(mutable_data.data(), lb_data_size),
+              std::span<std::byte>(reinterpret_cast<std::byte*>(hash.data()), hash.size())
+          );
+          cluster_hash_array[lb_idx] = std::move(hash);
+
+          // Block will be flushed when it goes out of scope
+        } else {
+          // Empty large block, hash is zeros
+          cluster_hash_array[lb_idx].resize(DeviceEncryption::DIGEST_SIZE, 0);
+        }
+      }
+      
+      cluster_hashes.push_back(std::move(cluster_hash_array));
+    }
   }
 
   // Create EntryMetadata
@@ -239,6 +314,10 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
     for (uint32_t blk : allocated_blocks) {
       quota_->DeleteBlocks(blk, 1);
     }
+    // Rollback allocated clusters for category 3
+    for (uint32_t blk : allocated_clusters) {
+      quota_->DeleteBlocks(blk, 64);
+    }
     return std::unexpected(WfsError::kNoSpace);
   }
 
@@ -265,6 +344,24 @@ std::expected<std::shared_ptr<File>, WfsError> Directory::CreateFile(std::string
       );
       block_meta->block_number = allocated_blocks[i];
       std::memcpy(block_meta->hash, block_hashes[i].data(), DeviceEncryption::DIGEST_SIZE);
+    }
+  }
+
+  // Write cluster info to metadata for category 3
+  if (category == 3 && !allocated_clusters.empty()) {
+    size_t clusters_count = allocated_clusters.size();
+    std::byte* metadata_end = reinterpret_cast<std::byte*>(file_metadata) + aligned_metadata_size;
+
+    // DataBlocksClusterMetadata is stored reversed at the end of metadata
+    for (size_t i = 0; i < clusters_count; ++i) {
+      DataBlocksClusterMetadata* cluster_meta = reinterpret_cast<DataBlocksClusterMetadata*>(
+          metadata_end - (i + 1) * sizeof(DataBlocksClusterMetadata)
+      );
+      cluster_meta->block_number = allocated_clusters[i];
+      // Copy 8 hashes for each large block in the cluster
+      for (size_t j = 0; j < 8; ++j) {
+        std::memcpy(cluster_meta->hash[j], cluster_hashes[i][j].data(), DeviceEncryption::DIGEST_SIZE);
+      }
     }
   }
 
