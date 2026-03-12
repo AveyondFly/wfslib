@@ -640,3 +640,121 @@ TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Partial block writes") {
     REQUIRE(read == data);
   }
 }
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Filename length tests") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+  auto test_data = MakeTestData(100, 0x42);
+
+  SECTION("Single character filename") {
+    auto result = root->CreateFile("a", test_data);
+    REQUIRE(result.has_value());
+    auto read = ReadFileData(result.value());
+    REQUIRE(read == test_data);
+  }
+
+  SECTION("Short filename") {
+    auto result = root->CreateFile("test", test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile("test").has_value());
+  }
+
+  SECTION("Medium filename (20 chars)") {
+    std::string name(20, 'x');
+    auto result = root->CreateFile(name, test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile(name).has_value());
+  }
+
+  SECTION("Longer filename (50 chars)") {
+    std::string name(50, 'y');
+    auto result = root->CreateFile(name, test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile(name).has_value());
+  }
+
+  SECTION("Filename with extension") {
+    auto result = root->CreateFile("document.txt", test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile("document.txt").has_value());
+  }
+
+  SECTION("Filename with multiple dots") {
+    auto result = root->CreateFile("file.tar.gz", test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile("file.tar.gz").has_value());
+  }
+
+  SECTION("Filename with numbers") {
+    auto result = root->CreateFile("file123.dat", test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile("file123.dat").has_value());
+  }
+
+  SECTION("Filename with underscore and hyphen") {
+    auto result = root->CreateFile("my_file-name.bin", test_data);
+    REQUIRE(result.has_value());
+    REQUIRE(root->GetFile("my_file-name.bin").has_value());
+  }
+
+  SECTION("Case insensitive - same name different case") {
+    auto result1 = root->CreateFile("testfile.bin", test_data);
+    REQUIRE(result1.has_value());
+    
+    // Same name with different case should fail (case insensitive filesystem)
+    auto data2 = MakeTestData(200, 0x43);
+    auto result2 = root->CreateFile("TESTFILE.bin", data2);
+    REQUIRE_FALSE(result2.has_value());
+  }
+
+  SECTION("Mixed case filename") {
+    auto result = root->CreateFile("MixedCaseFile.bin", test_data);
+    REQUIRE(result.has_value());
+    // Should be able to retrieve with different case
+    REQUIRE(root->GetFile("mixedcasefile.bin").has_value());
+    REQUIRE(root->GetFile("MIXEDCASEFILE.BIN").has_value());
+  }
+}
+
+TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Many files with various names") {
+  auto wfs = CreateWfs();
+  REQUIRE(wfs);
+  auto root = wfs->GetRootDirectory().value();
+
+  // Create files with different name patterns
+  std::vector<std::string> names = {
+    "a", "b", "c",                                           // Single char
+    "file1", "file2", "file3",                               // Short names
+    "document_with_long_name.bin",                           // Medium name
+    std::string(30, 'x') + ".dat",                           // Longer name
+    "test_file-1.bin", "test_file-2.bin", "test_file-3.bin", // With special chars
+    "UPPER.BIN", "lower.bin", "Mixed.Bin",                   // Case variations
+  };
+
+  // Create all files
+  for (size_t i = 0; i < names.size(); ++i) {
+    auto data = MakeTestData(100 + i, static_cast<uint8_t>(i));
+    auto result = root->CreateFile(names[i], data);
+    INFO("Failed to create: " << names[i]);
+    REQUIRE(result.has_value());
+  }
+
+  // Verify all files exist and have correct data
+  for (size_t i = 0; i < names.size(); ++i) {
+    auto file = root->GetFile(names[i]);
+    INFO("Failed to get: " << names[i]);
+    REQUIRE(file.has_value());
+
+    auto expected = MakeTestData(100 + i, static_cast<uint8_t>(i));
+    REQUIRE(ReadFileData(file.value()) == expected);
+  }
+
+  // Count entries
+  int count = 0;
+  for (const auto& entry : *root) {
+    (void)entry;
+    ++count;
+  }
+  REQUIRE(count == static_cast<int>(names.size()));
+}
