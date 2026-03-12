@@ -8,7 +8,7 @@
 #pragma once
 
 #include "directory_map_iterator.h"
-#include "errors.h"
+#include "wfs_errors.h"
 
 class QuotaArea;
 class Entry;

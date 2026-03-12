@@ -1,3 +1,4 @@
+#include "gcc_compat.h"
 /*
  * Copyright (C) 2024 koolkdev
  *

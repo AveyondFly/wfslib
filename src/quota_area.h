@@ -11,7 +11,7 @@
 
 #include "area.h"
 #include "entry.h"
-#include "errors.h"
+#include "wfs_errors.h"
 
 class Directory;
 class FreeBlocksAllocator;

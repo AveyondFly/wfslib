@@ -12,7 +12,7 @@
 #include <optional>
 #include <vector>
 
-#include "errors.h"
+#include "wfs_errors.h"
 
 class Device;
 class WfsDevice;

@@ -14,7 +14,7 @@
 #include "directory_iterator.h"
 #include "directory_map.h"
 #include "entry.h"
-#include "errors.h"
+#include "wfs_errors.h"
 
 class Area;
 class Block;

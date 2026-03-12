@@ -9,7 +9,7 @@
 
 #include "blocks_device.h"
 #include "directory.h"
-#include "errors.h"
+#include "wfs_errors.h"
 #include "file.h"
 #include "file_device.h"
 #include "key_file.h"

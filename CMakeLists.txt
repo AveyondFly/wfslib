@@ -4,8 +4,8 @@ project(wfslib)
 
 # Check compiler verions
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 14.0)
-        message(FATAL_ERROR "GCC version must be at least 14.0!")
+    if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 13.0)
+        message(FATAL_ERROR "GCC version must be at least 13.0!")
     endif()
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 18.0)

@@ -14,7 +14,7 @@
 #include <vector>
 
 #include "block.h"
-#include "errors.h"
+#include "wfs_errors.h"
 #include "structs.h"
 
 class BlocksDevice;

@@ -5,7 +5,7 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 
-#include "errors.h"
+#include "wfs_errors.h"
 
 char const* WfsException::what() const noexcept {
   switch (error_) {

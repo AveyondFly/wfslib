@@ -12,7 +12,7 @@
 #include <span>
 #include <vector>
 
-#include "errors.h"
+#include "wfs_errors.h"
 
 class BlocksDevice;
 
