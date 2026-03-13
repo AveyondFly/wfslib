@@ -758,3 +758,30 @@ TEST_CASE_METHOD(FileIOTestFixture, "FileIO: Many files with various names") {
   }
   REQUIRE(count == static_cast<int>(names.size()));
 }
+
+TEST_CASE_METHOD(FileIOTestFixture, "DeviceType is correctly set on Create", "[device_type]") {
+  // Test default device type (USB)
+  {
+    auto wfs = CreateWfs();
+    REQUIRE(wfs != nullptr);
+    REQUIRE(wfs->device_type() == DeviceType::USB);
+    wfs->Flush();
+  }
+
+  // Test MLC device type
+  {
+    auto device = std::make_shared<FileDevice>(img_path_, 9, img_size_ / 512, false, false);
+    auto result = WfsDevice::Create(device, DeviceType::MLC);
+    REQUIRE(result.has_value());
+    auto wfs = result.value();
+    REQUIRE(wfs->device_type() == DeviceType::MLC);
+    wfs->Flush();
+  }
+
+  // Verify device type persists after reopen
+  {
+    auto wfs = OpenWfs();
+    REQUIRE(wfs != nullptr);
+    REQUIRE(wfs->device_type() == DeviceType::MLC);
+  }
+}

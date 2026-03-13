@@ -117,12 +117,14 @@ std::expected<std::shared_ptr<WfsDevice>, WfsError> WfsDevice::Open(std::shared_
 
 // static
 std::expected<std::shared_ptr<WfsDevice>, WfsError> WfsDevice::Create(std::shared_ptr<Device> device,
+                                                                      DeviceType device_type,
                                                                       std::optional<std::vector<std::byte>> key) {
-  return Create(std::make_shared<BlocksDevice>(std::move(device), std::move(key)));
+  return Create(std::make_shared<BlocksDevice>(std::move(device), std::move(key)), device_type);
 }
 
 // static
-std::expected<std::shared_ptr<WfsDevice>, WfsError> WfsDevice::Create(std::shared_ptr<BlocksDevice> device) {
+std::expected<std::shared_ptr<WfsDevice>, WfsError> WfsDevice::Create(std::shared_ptr<BlocksDevice> device,
+                                                                      DeviceType device_type) {
   auto block = Block::LoadMetadataBlock(device, /*dvice_block_number=*/0, BlockSize::Logical, /*iv=*/0,
                                         /*load_data=*/false);
   if (!block.has_value()) {
@@ -130,7 +132,7 @@ std::expected<std::shared_ptr<WfsDevice>, WfsError> WfsDevice::Create(std::share
   }
 
   auto wfs_device = std::make_shared<WfsDevice>(std::move(device), std::move(*block));
-  wfs_device->Init();
+  wfs_device->Init(device_type);
   return wfs_device;
 }
 
@@ -169,7 +171,7 @@ std::expected<std::shared_ptr<TransactionsArea>, WfsError> WfsDevice::GetTransac
   return std::make_shared<TransactionsArea>(shared_from_this(), std::move(*block));
 }
 
-void WfsDevice::Init() {
+void WfsDevice::Init(DeviceType device_type) {
   constexpr uint32_t kTransactionsAreaEnd = 0x1000;
 
   uint32_t blocks_count =
@@ -184,7 +186,7 @@ void WfsDevice::Init() {
   auto* header = mutable_header();
   std::fill(reinterpret_cast<std::byte*>(header), reinterpret_cast<std::byte*>(header + 1), std::byte{0});
   header->iv = random_iv_generator(rand_engine);
-  header->device_type = static_cast<uint16_t>(DeviceType::USB);  // TODO
+  header->device_type = static_cast<uint16_t>(device_type);
   header->version = WFS_VERSION;
   header->root_quota_metadata.flags =
       EntryMetadata::DIRECTORY | EntryMetadata::AREA_SIZE_REGULAR | EntryMetadata::QUOTA;

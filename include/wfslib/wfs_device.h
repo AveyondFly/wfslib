@@ -33,6 +33,7 @@ class WfsDevice : public std::enable_shared_from_this<WfsDevice> {
   ~WfsDevice();
 
   BlocksDevice* device() { return device_.get(); }
+  DeviceType device_type() const;
 
   std::shared_ptr<Entry> GetEntry(std::string_view filename);
   std::shared_ptr<File> GetFile(std::string_view filename);
@@ -64,14 +65,17 @@ class WfsDevice : public std::enable_shared_from_this<WfsDevice> {
   static std::expected<std::shared_ptr<WfsDevice>, WfsError> Open(std::shared_ptr<BlocksDevice> device);
   static std::expected<std::shared_ptr<WfsDevice>, WfsError> Create(
       std::shared_ptr<Device> device,
+      DeviceType device_type = DeviceType::USB,
       std::optional<std::vector<std::byte>> key = std::nullopt);
-  static std::expected<std::shared_ptr<WfsDevice>, WfsError> Create(std::shared_ptr<BlocksDevice> device);
+  static std::expected<std::shared_ptr<WfsDevice>, WfsError> Create(
+      std::shared_ptr<BlocksDevice> device,
+      DeviceType device_type = DeviceType::USB);
 
  private:
   friend class Area;
   friend class QuotaArea;
 
-  void Init();
+  void Init(DeviceType device_type);
 
   uint32_t CalcIV(const Area* area, uint32_t physical_block_number) const;
 
@@ -85,3 +89,7 @@ class WfsDevice : public std::enable_shared_from_this<WfsDevice> {
   std::shared_ptr<BlocksDevice> device_;
   std::shared_ptr<Block> root_block_;
 };
+
+inline DeviceType WfsDevice::device_type() const {
+  return static_cast<DeviceType>(header()->device_type.value());
+}
