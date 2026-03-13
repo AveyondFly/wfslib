@@ -49,6 +49,10 @@ class QuotaArea : public Area, public std::enable_shared_from_this<QuotaArea> {
 
   std::expected<std::shared_ptr<FreeBlocksAllocator>, WfsError> GetFreeBlocksAllocator();
 
+ protected:
+  std::span<const WfsAreaFragmentInfo> get_fragments() const override;
+  size_t get_fragments_count() const override;
+
  private:
   friend class Recovery;
   friend class WfsDevice;

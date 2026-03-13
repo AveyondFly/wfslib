@@ -20,6 +20,14 @@
 QuotaArea::QuotaArea(std::shared_ptr<WfsDevice> wfs_device, std::shared_ptr<Block> header_block)
     : Area(std::move(wfs_device), std::move(header_block)) {}
 
+std::span<const WfsAreaFragmentInfo> QuotaArea::get_fragments() const {
+  return quota_header()->fragments;
+}
+
+size_t QuotaArea::get_fragments_count() const {
+  return quota_header()->fragments_count.value();
+}
+
 // static
 std::expected<std::shared_ptr<QuotaArea>, WfsError> QuotaArea::Create(std::shared_ptr<WfsDevice> wfs_device,
                                                                       std::shared_ptr<Area> parent_area,

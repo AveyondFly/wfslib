@@ -8,6 +8,7 @@
 #pragma once
 
 #include <memory>
+#include <span>
 
 #include "block.h"
 #include "structs.h"
@@ -35,13 +36,8 @@ class Area {
                                                                 bool encrypted,
                                                                 bool new_block = false) const;
 
-  uint32_t to_area_block_number(uint32_t physical_block_number) const {
-    return to_area_blocks_count(physical_block_number - header_block_->physical_block_number());
-  }
-
-  uint32_t to_physical_block_number(uint32_t area_block_number) const {
-    return header_block_->physical_block_number() + to_physical_blocks_count(area_block_number);
-  }
+  uint32_t to_area_block_number(uint32_t physical_block_number) const;
+  uint32_t to_physical_block_number(uint32_t area_block_number) const;
 
   uint32_t to_area_blocks_count(uint32_t physical_blocks_count) const {
     return physical_blocks_count >> (block_size_log2() - log2_size(BlockSize::Physical));
@@ -55,6 +51,8 @@ class Area {
   size_t block_size() const { return size_t{1} << block_size_log2(); }
 
   uint32_t physical_block_number() const { return header_block_->physical_block_number(); }
+
+  size_t fragments_log2_block_size() const { return header()->fragments_log2_block_size.value(); }
 
   // In area blocks count
   uint32_t blocks_count() const { return header()->blocks_count.value(); }
@@ -77,6 +75,9 @@ class Area {
   const std::shared_ptr<WfsDevice>& wfs_device() { return wfs_device_; }
 
   bool is_root_area() const { return physical_block_number() == 0; }
+
+  virtual std::span<const WfsAreaFragmentInfo> get_fragments() const;
+  virtual size_t get_fragments_count() const;
 
  private:
   std::shared_ptr<WfsDevice> wfs_device_;
